@@ -31,6 +31,12 @@ import { parseThemeName } from './use-probe'
 import { EXTRA_LICENSE_BADGES, HEADER_LICENSE_BADGES } from './license-badges'
 import { FLAG_OPTIONS } from './country-flag'
 import { displayServerName } from './server-name'
+import {
+  dailyTrafficRows,
+  hasTrafficPeriod,
+  trafficRuleLabel,
+  type TrafficRange,
+} from './traffic-display'
 import { BlackGoldGlobe, type PremiumProbeRegion } from './BlackGoldGlobe'
 import './premium-probe.css'
 
@@ -1923,8 +1929,8 @@ function PremiumServerCard({
   const mem = resourcePercentage(server.mem_used, server.mem_total)
   const disk = resourcePercentage(server.disk_used, server.disk_total)
   const trafficUsed =
-    server.traffic_used_total ??
     server.traffic_used ??
+    server.traffic_used_total ??
     server.traffic_used_up ??
     0
   const trafficValue = server.traffic_limit
@@ -2061,8 +2067,65 @@ function ServerDetailDrawer({
   const mem = resourcePercentage(server.mem_used, server.mem_total)
   const disk = resourcePercentage(server.disk_used, server.disk_total)
   const latency = averageLatency(server)
-  const traffic = summarizeSevenDayTraffic([server])
+  // 原始上下行日流量: 周期/最近7日切换(照上游 6221dd1 + 主控 drawer)
+  const hasDailyPeriod = hasTrafficPeriod(server)
+  const [trafficRange, setTrafficRange] = useState<TrafficRange>(() =>
+    hasDailyPeriod ? 'period' : 'recent7',
+  )
+  // 总流量/上行/下行 行切换(照二级详情页 traffic-line-toggle)
+  const [trafficLines, setTrafficLines] = useState<Set<'total' | 'uplink' | 'downlink'>>(
+    () => new Set(['total', 'uplink', 'downlink']),
+  )
+  const toggleTrafficLine = (key: 'total' | 'uplink' | 'downlink') => {
+    setTrafficLines((prev) => {
+      const next = new Set(prev)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
+    })
+  }
+  const traffic = dailyTrafficRows(server, trafficRange).map((item) => ({
+    ...item,
+    total: item.total || item.uplink + item.downlink,
+  }))
   const maxTraffic = Math.max(1, ...traffic.map((item) => item.total))
+  // 流量计费口径(照主控 premium drawer: 本周期计费用量/原始周期/校准调整/对账/周期/开机网卡)
+  const accounting =
+    server.traffic_used === undefined
+      ? null
+      : {
+          used: formatTrafficCompact(server.traffic_used),
+          meter: trafficRuleLabel(server),
+          rawUp: formatTrafficCompact(server.traffic_used_up ?? 0),
+          rawDown: formatTrafficCompact(server.traffic_used_down ?? 0),
+          hasRaw:
+            server.traffic_used_up !== undefined ||
+            server.traffic_used_down !== undefined,
+          adj:
+            server.traffic_adjustment === undefined
+              ? null
+              : `${server.traffic_adjustment < 0 ? '−' : '+'}${formatTrafficCompact(Math.abs(server.traffic_adjustment))}`,
+          recon:
+            server.traffic_used_total !== undefined &&
+            server.traffic_adjustment !== undefined
+              ? `${formatTrafficCompact(server.traffic_used_total)} ${
+                  server.traffic_adjustment < 0 ? '−' : '+'
+                } ${formatTrafficCompact(Math.abs(server.traffic_adjustment))} = ${formatTrafficCompact(server.traffic_used)}`
+              : null,
+          period:
+            server.period_start && server.period_end
+              ? `${server.period_start.slice(5)} — ${server.period_end.slice(5)}`
+              : null,
+          boot:
+            (server.boot_traffic_up !== undefined ||
+              server.boot_traffic_down !== undefined) &&
+            server.boot_traffic_scope !== 'all_time'
+              ? {
+                  up: formatTrafficCompact(server.boot_traffic_up ?? 0),
+                  down: formatTrafficCompact(server.boot_traffic_down ?? 0),
+                }
+              : null,
+        }
   useEffect(() => {
     const close = (event: KeyboardEvent) => event.key === 'Escape' && onClose()
     window.addEventListener('keydown', close)
@@ -2113,23 +2176,109 @@ function ServerDetailDrawer({
             <strong>{latency === undefined ? '—' : `${latency} ms`}</strong>
           </div>
         </div>
-        <section className='premium-probe-drawer-section'>
-          <h3>近 7 日流量</h3>
-          <div className='premium-probe-drawer-traffic'>
-            {traffic.map((item) => (
-              <div key={item.date}>
-                <span>{item.date.slice(5)}</span>
-                <i>
-                  <b
-                    style={{ width: `${(item.downlink / maxTraffic) * 100}%` }}
-                  />
-                  <b
-                    style={{ width: `${(item.uplink / maxTraffic) * 100}%` }}
-                  />
-                </i>
-                <strong>{formatTrafficCompact(item.total)}</strong>
+        {accounting && (
+          <section className='premium-probe-drawer-section'>
+            <h3>流量计费口径</h3>
+            <div className='premium-probe-drawer-accounting'>
+              <div>
+                <span>本周期计费用量</span>
+                <strong>{accounting.used}</strong>
               </div>
+              {accounting.meter && <p>计费口径：{accounting.meter}</p>}
+              {accounting.hasRaw && (
+                <p>
+                  原始周期：↑ {accounting.rawUp} · ↓ {accounting.rawDown}
+                </p>
+              )}
+              {accounting.adj && <p>校准/周期边界调整：{accounting.adj}</p>}
+              {accounting.recon && <p>对账：{accounting.recon}</p>}
+              {accounting.period && <p>周期：{accounting.period}</p>}
+              {accounting.boot && (
+                <p>
+                  本次开机网卡：↑ {accounting.boot.up} · ↓ {accounting.boot.down}
+                </p>
+              )}
+            </div>
+          </section>
+        )}
+        <section className='premium-probe-drawer-section'>
+          <div className='premium-probe-traffic-heading'>
+            <h3>原始上下行日流量</h3>
+            <div role='group' aria-label='趋势范围'>
+              {hasDailyPeriod && (
+                <button
+                  type='button'
+                  className={trafficRange === 'period' ? 'is-active' : ''}
+                  onClick={() => setTrafficRange('period')}
+                >
+                  当前周期
+                </button>
+              )}
+              <button
+                type='button'
+                className={trafficRange === 'recent7' ? 'is-active' : ''}
+                onClick={() => setTrafficRange('recent7')}
+              >
+                最近 7 日
+              </button>
+            </div>
+          </div>
+          <p className='premium-probe-traffic-note'>
+            以下为原始上、下行，不应用计费方向或对账调整。
+          </p>
+          <div className='traffic-line-toggle'>
+            {(
+              [
+                { key: 'total', label: '总流量', stroke: '#3b82f6' },
+                { key: 'uplink', label: '上行流量', stroke: '#f97316' },
+                { key: 'downlink', label: '下行流量', stroke: '#22c55e' },
+              ] as const
+            ).map((line) => (
+              <button
+                type='button'
+                key={line.key}
+                className={trafficLines.has(line.key) ? 'active' : 'off'}
+                style={{ '--line-color': line.stroke } as React.CSSProperties}
+                onClick={() => toggleTrafficLine(line.key)}
+              >
+                <span className='dot' />
+                {line.label}
+              </button>
             ))}
+          </div>
+          <div className='premium-probe-drawer-traffic'>
+            {traffic.length === 0 ? (
+              <p>暂无每日流量数据</p>
+            ) : (
+              traffic.map((item) => (
+                <div key={item.date}>
+                  <span>{item.date.slice(5)}</span>
+                  <i>
+                    {trafficLines.has('downlink') && (
+                      <b
+                        style={{
+                          width: `${(item.downlink / maxTraffic) * 100}%`,
+                        }}
+                      />
+                    )}
+                    {trafficLines.has('uplink') && (
+                      <b
+                        style={{ width: `${(item.uplink / maxTraffic) * 100}%` }}
+                      />
+                    )}
+                  </i>
+                  <strong>
+                    {trafficLines.has('total')
+                      ? formatTrafficCompact(item.total)
+                      : item.uplink !== undefined && item.downlink !== undefined && trafficLines.size === 2
+                        ? `${formatTrafficCompact(trafficLines.has('uplink') ? item.uplink : item.downlink)}`
+                        : trafficLines.has('uplink') || trafficLines.has('downlink')
+                          ? `${formatTrafficCompact(trafficLines.has('uplink') ? item.uplink : item.downlink)}`
+                          : '—'}
+                  </strong>
+                </div>
+              ))
+            )}
           </div>
         </section>
         <section className='premium-probe-drawer-section'>
@@ -2285,7 +2434,17 @@ export function PremiumProbePage({
     apply()
     if (colorMode !== 'auto') return
     const timer = window.setInterval(apply, 60_000) // 跨 6/18 点自动切换
-    return () => window.clearInterval(timer)
+    // iOS/Safari 后台标签 interval 会被冻结: 回到前台立即重算, 不等下一个 60s tick
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') apply()
+    }
+    document.addEventListener('visibilitychange', onVisible)
+    window.addEventListener('focus', onVisible)
+    return () => {
+      window.clearInterval(timer)
+      document.removeEventListener('visibilitychange', onVisible)
+      window.removeEventListener('focus', onVisible)
+    }
   }, [colorMode])
   const cycleColorMode = () => {
     manualColorRef.current = true
