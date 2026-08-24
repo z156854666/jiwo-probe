@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState } from 'react'
+import { createContext, createElement, useContext, useEffect, useRef, useState } from 'react'
+import type { ReactNode } from 'react'
 import type { ProbeAppearance, ProbePayload, ProbeServer, ThemeName } from './types'
 
 const APPEARANCE_CACHE = 'mmwx-probe-appearance'
@@ -287,10 +288,20 @@ function applyFavicon(icon?: string) {
   link.href = href
 }
 
-export function useProbe(): { data?: ProbePayload; error?: string } {
+export interface ProbeState {
+  data?: ProbePayload
+  error?: string
+}
+
+const ProbeContext = createContext<ProbeState | null>(null)
+
+function useProbeConnection(): ProbeState {
   const [data, setData] = useState<ProbePayload>()
   const [error, setError] = useState<string>()
   const timer = useRef<number | undefined>(undefined)
+  const watchdogTimer = useRef<number | undefined>(undefined)
+  const lastFrameAt = useRef(0)
+  const wsRef = useRef<WebSocket | undefined>(undefined)
 
   useEffect(() => {
     let stopped = false
@@ -313,36 +324,74 @@ export function useProbe(): { data?: ProbePayload; error?: string } {
         if (!stopped) setError(cause instanceof Error ? cause.message : String(cause))
       }
     }
+    const stopPolling = () => {
+      if (timer.current) {
+        window.clearInterval(timer.current)
+        timer.current = undefined
+      }
+    }
     const startPolling = () => {
-      if (timer.current) return
+      if (stopped || timer.current) return
       void poll()
       timer.current = window.setInterval(poll, 5000)
     }
 
     applyAppearance()
-    // Keep polling as a fallback even when the WebSocket handshake succeeds.
-    // Some proxies leave an idle WebSocket open without forwarding later frames,
-    // which otherwise freezes realtime speed at the first snapshot.
+    // 先轮询一次拿首帧数据, 同时连 WS; 之后由 watchdog 统一裁决:
+    // WS 有帧 → 暂停轮询(帧即数据, 免每 5s 打主控一次);
+    // WS 无帧 15s / 关闭 / 出错 → 恢复轮询兜底。
     startPolling()
     try {
       const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
       ws = new WebSocket(`${protocol}//${location.host}/api/stream`)
+      wsRef.current = ws
       ws.onmessage = (event) => {
-        try { accept(JSON.parse(event.data) as ProbePayload) } catch { /* wait for next frame */ }
+        try {
+          accept(JSON.parse(event.data) as ProbePayload)
+          lastFrameAt.current = Date.now()
+        } catch { /* wait for next frame */ }
       }
-      ws.onerror = startPolling
-      ws.onclose = startPolling
+      ws.onerror = () => startPolling()
+      ws.onclose = () => startPolling()
     } catch {
       startPolling()
     }
 
+    // 看门狗(2s 一跳): WS 打开且 15s 内有帧 → 停轮询; 否则恢复轮询。
+    // 覆盖两类场景: WS 假死(代理保持连接但不推帧, 原代码因此无条件轮询,
+    // 导致主控每 5s 一次 key exchange + information_schema 无缓存查询 → CPU 高)
+    // 与 WS 未连上(回调兜底之外的双保险)。
+    watchdogTimer.current = window.setInterval(() => {
+      if (stopped) return
+      const current = wsRef.current
+      const alive = !!current && current.readyState === WebSocket.OPEN && Date.now() - lastFrameAt.current < 15000
+      if (alive) stopPolling()
+      else startPolling()
+    }, 2000)
+
     return () => {
       stopped = true
       ws?.close()
+      wsRef.current = undefined
       if (timer.current) window.clearInterval(timer.current)
       timer.current = undefined
+      if (watchdogTimer.current) window.clearInterval(watchdogTimer.current)
+      watchdogTimer.current = undefined
     }
   }, [])
 
   return { data, error }
+}
+
+// 全站只在 Provider 内建立一套 HTTP/WS 连接。各主题调用 useProbe() 时只读取
+// 同一个 Context，避免 Root + App/Ran 为每个标签页重复连接主控。
+export function ProbeProvider({ children }: { children: ReactNode }) {
+  const value = useProbeConnection()
+  return createElement(ProbeContext.Provider, { value }, children)
+}
+
+export function useProbe(): ProbeState {
+  const value = useContext(ProbeContext)
+  if (!value) throw new Error('useProbe must be used within ProbeProvider')
+  return value
 }
