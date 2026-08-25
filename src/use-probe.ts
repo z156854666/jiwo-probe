@@ -72,7 +72,9 @@ function enrichPayload(payload: ProbePayload): ProbePayload {
   const next: DailyHistory = prev && typeof prev === 'object' ? JSON.parse(JSON.stringify(prev)) : {}
   for (const server of payload.servers) {
     const name = server.name?.trim()
-    if (!name || !Array.isArray(server.daily_traffic)) continue
+    // ProbeHub 的估算历史由 Durable Object 统一保存；不再写入访客 localStorage，
+    // 避免主控恢复真实 daily_traffic 后旧估算数据继续混入。
+    if (!name || server.daily_traffic_estimated || !Array.isArray(server.daily_traffic)) continue
     next[name] = next[name] ?? {}
     for (const row of server.daily_traffic) {
       if (!row?.date) continue
@@ -105,7 +107,7 @@ export function parseThemeName(raw: string): { theme: string; gold: boolean; pla
 // 未知主题名照常挂 theme-{name} 类——站长可在自己的 CSS 里写 .theme-{name} 覆盖，
 // 没写则回退到默认(pixel)样式。返回值 = 是否内置主题（供 UI 判断"跟随主控"时如何显示）。
 export function isBuiltinTheme(value?: string): boolean {
-  return value === 'pixel' || value === 'flat' || value === 'anime' || value === 'glass' || value === 'lumina' || value === 'premium' || value === 'luminagold' || value === 'luminaplatinum' || value === 'premiumplatinum' || value === 'premiumlight' || value === 'ran' || value === 'glassmorphism'
+  return value === 'pixel' || value === 'flat' || value === 'anime' || value === 'glass' || value === 'lumina' || value === 'premium' || value === 'luminagold' || value === 'luminaplatinum' || value === 'premiumplatinum' || value === 'premiumlight' || value === 'ran' || value === 'glassmorphism' || value === 'emerald'
 }
 
 export function applyAppearance(input?: ProbeAppearance) {
